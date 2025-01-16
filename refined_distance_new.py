@@ -13,8 +13,8 @@ with open('undirect_graph.txt', 'r') as f:  # Open the file containing edges in 
 weighted_edges = []  # Initialize an empty list to store edges with weights and probabilities
 for edge in edges:
     u, v = edge
-    d = random.uniform(0.1, 1.0)  # Random distance between 0.1 and 1.0
-    p = random.uniform(0.1, 1.0)  # Random probability between 0.1 and 1.0
+    d = random.uniform(0, 1.0)  # Random distance between 0 and 1.0
+    p = random.uniform(0, 1.0)  # Random probability between 0 and 1.0
     weighted_edges.append((u, v, d, p))
 
 # Save the weighted edges to a new file in the same directory
