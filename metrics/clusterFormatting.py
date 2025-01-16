@@ -23,7 +23,7 @@ def parse_and_format_clusters(input_file, output_file):
 
                     # Write each member with its cluster ID
                     for member in members:
-                        outfile.write(f"{member} {cluster_id}\n")
+                        outfile.write(f"{cluster_id} {member}\n")
 
                     cluster_id += 1  # Increment the cluster ID for the next cluster
 
