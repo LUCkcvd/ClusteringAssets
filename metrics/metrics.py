@@ -196,7 +196,7 @@ def main():
         # Edge case if finalAVU=0 => 1/AVU => infinite => handle gracefully
         finalQANUI = float("inf")  
     else:
-        finalQANUI = (2.0 * finalAVI * (1.0 / finalAVU)) / (finalAVI + (1.0 / finalAVU))
+        finalQANUI = ((2.0 * finalAVI * (1.0 / finalAVU)) / (finalAVI + (1.0 / finalAVU))) / 2
 
     #####################################################################
     # 8. PRINT RESULTS
