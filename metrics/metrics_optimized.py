@@ -46,15 +46,22 @@ def read_graph_lazy(filename):
     return edges, nodes_list, node_to_idx
 
 def normalize_weight(w):
-    """Normalize weight to [0,1) range using vectorized operations."""
-    return 0.99 * (1 / (1 + np.exp(-w)))
+    """Normalize weight to [0,1) range using vectorized operations with numerical stability."""
+    # Clip weights to prevent overflow/underflow in exp
+    w_clipped = np.clip(w, -100, 100)
+    # Use 0.98 instead of 0.99 to ensure better numerical stability
+    return 0.98 * (1 / (1 + np.exp(-w_clipped)))
 
 def build_adjacency_dict(edges):
-    """Build adjacency dictionary for O(E) space complexity."""
+    """Build adjacency dictionary for O(E) space complexity with numerical stability."""
     adj_dict = defaultdict(dict)
     for u_idx, v_idx, w in edges:
         w_norm = normalize_weight(w)
-        weight = 1.0 / (1.0 - w_norm)
+        # Add numerical stability check
+        if w_norm >= 0.99:  # Prevent division by numbers too close to 1
+            weight = 100.0  # Cap the maximum weight
+        else:
+            weight = 1.0 / (1.0 - w_norm)
         # Add both directions for undirected graph
         adj_dict[int(u_idx)][int(v_idx)] = weight
         adj_dict[int(v_idx)][int(u_idx)] = weight
@@ -83,34 +90,63 @@ def read_clusters(filename, node_to_idx):
 
 def compute_AVU_dprime(Ci, Cj, adj_dict):
     """Compute AVU'' using adjacency dictionary for O(E) complexity."""
+    if len(Ci) == 0 or len(Cj) == 0:
+        return 0.0
+        
+    same_cluster = Ci == Cj
     numerator = 0.0
-    sum_w_Ci = 0.0
-    sum_w_Cj = 0.0
     
-    # Compute numerator and Ci sum
+    # Calculate total possible connections for normalization
+    total_connections = len(Ci) * len(Cj) if not same_cluster else (len(Ci) * (len(Ci) - 1)) // 2
+    if total_connections == 0:
+        return 0.0
+    
+    # For each node in Ci
     for u in Ci:
         u_edges = adj_dict.get(u, {})
-        sum_w_Ci += sum(u_edges.values())
+        if not u_edges:
+            continue
+            
+        # Get total weight for normalization
+        w_u = sum(u_edges.values())
+        if w_u < 1e-10:
+            continue
+            
+        # For same cluster, only count each pair once and normalize by total possible connections
+        if same_cluster:
+            for v in Cj:
+                if v > u and v in u_edges:  # Only count pairs once
+                    numerator += (u_edges[v] / w_u) / total_connections
+        else:
+            # Sum normalized weights to nodes in Cj
+            u_to_Cj = sum(weight for v, weight in u_edges.items() if v in Cj)
+            numerator += (u_to_Cj / w_u) / (2.0 * total_connections)
+    
+    # For different clusters, also count edges from Cj to Ci
+    if not same_cluster:
         for v in Cj:
-            if v in u_edges:
-                numerator += u_edges[v]
+            v_edges = adj_dict.get(v, {})
+            if not v_edges:
+                continue
+                
+            w_v = sum(v_edges.values())
+            if w_v < 1e-10:
+                continue
+                
+            v_to_Ci = sum(weight for u, weight in v_edges.items() if u in Ci)
+            numerator += (v_to_Ci / w_v) / (2.0 * total_connections)
     
-    # Compute Cj sum
-    for v in Cj:
-        sum_w_Cj += sum(adj_dict.get(v, {}).values())
-    
-    denom = max(1.0, sum_w_Ci) + max(1.0, sum_w_Cj)
-    return numerator / denom if denom != 0 else 0.0
+    return numerator
 
 def compute_AVI_dprime(Ci, adj_dict, n_nodes):
-    """Compute AVI'' using adjacency dictionary for O(E) complexity."""
+    """Compute AVI'' using adjacency dictionary for O(E) complexity with numerical stability."""
     sum_intra = 0.0
     sum_out = 0.0
     
     for u in Ci:
         u_edges = adj_dict.get(u, {})
         w_u = sum(u_edges.values())
-        if w_u == 0:
+        if w_u < 1e-10:  # Use small epsilon instead of exact 0
             continue
             
         # Compute intra-cluster sum
@@ -120,10 +156,12 @@ def compute_AVI_dprime(Ci, adj_dict, n_nodes):
         
         # Compute out-cluster sum
         out_sum = sum(weight for v, weight in u_edges.items() if v not in Ci)
-        sum_out += out_sum / w_u if w_u > 0 else 0
+        # Use epsilon to prevent division by very small numbers
+        sum_out += out_sum / w_u if w_u >= 1e-10 else 0
     
     denom = sum_intra + sum_out
-    return sum_intra / denom if denom != 0 else 0.0
+    # Use epsilon comparison instead of exact 0
+    return sum_intra / denom if denom >= 1e-10 else 0.0
 
 def main():
     print("[1/7] Starting QANUI calculation...")
