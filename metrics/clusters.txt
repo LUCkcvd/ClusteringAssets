@@ -1,0 +1,6 @@
+C1 A
+C1 B
+C2 C
+C2 D
+C3 E
+C3 F
