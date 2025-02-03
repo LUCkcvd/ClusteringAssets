@@ -9,12 +9,16 @@ random.seed(25)
 with open('undirect_graph.txt', 'r') as f:  # Open the file containing edges in read mode
     edges = [line.strip().split() for line in f]  # Read each line, strip whitespace, and split into a list of node pairs
 
+# Define minimum value to prevent division by zero
+MIN_VALUE = 0.000001
+
 # Generate random weights (original distance d) and probabilities (p) for each edge
 weighted_edges = []  # Initialize an empty list to store edges with weights and probabilities
 for edge in edges:
     u, v = edge
-    d = random.uniform(0.1, 1.0)  # Random distance between 0.1 and 1.0
-    p = random.uniform(0.1, 1.0)  # Random probability between 0.1 and 1.0
+    # Generate non-zero random numbers in (0,1]
+    d = 1 -random.uniform(0,1)
+    p = 1 - random.uniform(0,1) 
     weighted_edges.append((u, v, d, p))
 
 # Save the weighted edges to a new file in the same directory
@@ -35,14 +39,18 @@ def compute_refined_metrics(edges):
     """
     refined_edges = []
     for u, v, d, p in edges:
-        # Calculate closeness
-        C_uv = (1/d) * p
+        # Ensure values are at least MIN_VALUE
+        safe_d = max(d, MIN_VALUE)
+        safe_p = max(p, MIN_VALUE)
         
-        # Calculate refined distance
-        refined_distance = 1/C_uv if C_uv != 0 else float('inf')
+        # Calculate closeness with safe values
+        C_uv = (1/safe_d) * safe_p
         
-        # Normalize the refined distance to be between 0 and 1
-        refined_distance = min(1.0, refined_distance/10.0)
+        # Calculate refined distance with protection against zero
+        refined_distance = 1/max(C_uv, MIN_VALUE)
+        
+        # Normalize the refined distance to be between 0.1 and 1
+        refined_distance = max(0.1, min(1.0, refined_distance/10.0))
         
         refined_edges.append((u, v, refined_distance))
     return refined_edges
