@@ -10,6 +10,10 @@ def read_graph_lazy(filename):
     nodes = set()
     edge_count = 0
     
+    # Enable garbage collection for better memory management
+    import gc
+    gc.enable()
+    
     # First pass: count edges and collect nodes
     with open(filename, "r") as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
@@ -163,6 +167,33 @@ def compute_AVI_dprime(Ci, adj_dict, n_nodes):
     # Use epsilon comparison instead of exact 0
     return sum_intra / denom if denom >= 1e-10 else 0.0
 
+def process_avu_batch(start_idx, end_idx, clusterIDs, clusters, adj_dict):
+    """Process a batch of AVU calculations."""
+    batch_values = {}
+    
+    # Force garbage collection before processing each batch
+    import gc
+    gc.collect()
+    
+    # Calculate total pairs for progress reporting
+    total_pairs = len(clusterIDs) - start_idx
+    processed_pairs = 0
+    
+    for i in range(start_idx, min(end_idx, len(clusterIDs))):
+        if processed_pairs % 10 == 0:  # Print progress every 10 pairs
+            print(f"        Progress: {processed_pairs}/{total_pairs} pairs processed", end='\r')
+        # Compute diagonal value
+        Ci = clusters[clusterIDs[i]]
+        val = compute_AVU_dprime(Ci, Ci, adj_dict)
+        batch_values[(clusterIDs[i], clusterIDs[i])] = val
+        
+        # Compute pairs with previous clusters
+        for j in range(i + 1, len(clusterIDs)):
+            Cj = clusters[clusterIDs[j]]
+            val = compute_AVU_dprime(Ci, Cj, adj_dict)
+            batch_values[(clusterIDs[i], clusterIDs[j])] = val
+    return batch_values
+
 def main():
     print("[1/7] Starting QANUI calculation...")
     
@@ -177,7 +208,8 @@ def main():
     clusters_path = os.path.join(script_dir, "clusters.txt")
     clusters = read_clusters(clusters_path, node_to_idx)
     clusterIDs = sorted(clusters.keys())
-    print(f"    Found {len(clusterIDs)} clusters.")
+    num_clusters = len(clusterIDs)
+    print(f"    Found {num_clusters} clusters.")
     
     print("[4/7] Building adjacency dictionary...")
     adj_dict = compute_delta_dprime_matrix(edges, n_nodes)
@@ -186,39 +218,46 @@ def main():
     AVU_values = {}
     AVI_values = {}
     
-    # Compute AVU'' for all pairs
-    for i, j in combinations(range(len(clusterIDs)), 2):
-        Ci = clusters[clusterIDs[i]]
-        Cj = clusters[clusterIDs[j]]
-        val = compute_AVU_dprime(Ci, Cj, adj_dict)
-        AVU_values[(clusterIDs[i], clusterIDs[j])] = val
-        AVU_values[(clusterIDs[j], clusterIDs[i])] = val
+    # Process AVU calculations in batches
+    # Dynamically adjust batch size based on number of clusters
+    BATCH_SIZE = max(10, min(100, 10000 // num_clusters))  # Smaller batches for larger cluster counts
+    total_batches = (num_clusters + BATCH_SIZE - 1) // BATCH_SIZE
     
-    # Compute diagonal AVU values
-    for i in range(len(clusterIDs)):
-        Ci = clusters[clusterIDs[i]]
-        val = compute_AVU_dprime(Ci, Ci, adj_dict)
-        AVU_values[(clusterIDs[i], clusterIDs[i])] = val
+    for batch in range(total_batches):
+        start_idx = batch * BATCH_SIZE
+        end_idx = min((batch + 1) * BATCH_SIZE, num_clusters)
+        print(f"    Processing AVU batch {batch + 1}/{total_batches} (clusters {start_idx}-{end_idx})...")
+        
+        batch_values = process_avu_batch(start_idx, end_idx, clusterIDs, clusters, adj_dict)
+        AVU_values.update(batch_values)
     
-    # Compute AVI'' for each cluster
-    for cID in clusterIDs:
-        Ci = clusters[cID]
-        val = compute_AVI_dprime(Ci, adj_dict, n_nodes)
-        AVI_values[cID] = val
+    # Compute AVI'' for each cluster in batches
+    print("    Computing AVI values...")
+    for i in range(0, num_clusters, BATCH_SIZE):
+        end_idx = min(i + BATCH_SIZE, num_clusters)
+        for j in range(i, end_idx):
+            cID = clusterIDs[j]
+            Ci = clusters[cID]
+            val = compute_AVI_dprime(Ci, adj_dict, n_nodes)
+            AVI_values[cID] = val
     
     print("[6/7] Computing final metrics...")
     
-    if len(clusterIDs) == 1:
+    if num_clusters == 1:
         cID = clusterIDs[0]
         finalAVI = AVI_values[cID]
         finalAVU = AVU_values[(cID, cID)]
     else:
         finalAVI = np.mean(list(AVI_values.values()))
         
-        # Average AVU over distinct pairs
-        avu_values = [AVU_values[(clusterIDs[i], clusterIDs[j])]
-                     for i, j in combinations(range(len(clusterIDs)), 2)]
-        finalAVU = np.mean(avu_values) if avu_values else 0.0
+        # Average AVU over distinct pairs without generating all combinations at once
+        avu_sum = 0.0
+        pair_count = 0
+        for i in range(num_clusters):
+            for j in range(i + 1, num_clusters):
+                avu_sum += AVU_values[(clusterIDs[i], clusterIDs[j])]
+                pair_count += 1
+        finalAVU = avu_sum / pair_count if pair_count > 0 else 0.0
     
     if finalAVU == 0.0:
         finalQANUI = float("inf")
@@ -228,18 +267,33 @@ def main():
     
     print("[7/7] Results:\n")
     
-    print("===== PARTIAL AVU''(C_i, C_j) Results =====")
-    for i in range(len(clusterIDs)):
-        for j in range(i, len(clusterIDs)):
-            val = AVU_values[(clusterIDs[i], clusterIDs[j])]
-            print(f"  AVU''({clusterIDs[i]}, {clusterIDs[j]}) = {val:.5f}")
-    print()
-    
-    print("===== AVI''(C_i) Results =====")
-    for cID in clusterIDs:
-        val = AVI_values[cID]
-        print(f"  AVI''({cID}) = {val:.5f}")
-    print()
+    # For large cluster counts, only print summary statistics to avoid memory issues
+    if len(clusterIDs) > 1000:
+        print("===== METRICS SUMMARY (abbreviated for large cluster count) =====")
+        print(f"Number of clusters: {len(clusterIDs)}")
+        print(f"Sample of AVU values (first 5 pairs):")
+        for i in range(min(5, len(clusterIDs))):
+            for j in range(i, min(i+2, len(clusterIDs))):
+                val = AVU_values[(clusterIDs[i], clusterIDs[j])]
+                print(f"  AVU''({clusterIDs[i]}, {clusterIDs[j]}) = {val:.5f}")
+        print("\nSample of AVI values (first 5 clusters):")
+        for i in range(min(5, len(clusterIDs))):
+            val = AVI_values[clusterIDs[i]]
+            print(f"  AVI''({clusterIDs[i]}) = {val:.5f}")
+        print()
+    else:
+        print("===== PARTIAL AVU''(C_i, C_j) Results =====")
+        for i in range(len(clusterIDs)):
+            for j in range(i, len(clusterIDs)):
+                val = AVU_values[(clusterIDs[i], clusterIDs[j])]
+                print(f"  AVU''({clusterIDs[i]}, {clusterIDs[j]}) = {val:.5f}")
+        print()
+        
+        print("===== AVI''(C_i) Results =====")
+        for cID in clusterIDs:
+            val = AVI_values[cID]
+            print(f"  AVI''({cID}) = {val:.5f}")
+        print()
     
     print("===== FINAL METRICS =====")
     print(f"  Final AVI'' = {finalAVI:.5f}")

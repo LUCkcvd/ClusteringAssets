@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import argparse
 import sys
 import numpy as np
 import mmap
@@ -8,11 +9,15 @@ import json
 import tempfile
 from pathlib import Path
 import gc
+import shutil
+import signal
+import atexit
 
 class MetricsComputer:
-    def __init__(self, graph_path, clusters_path):
+    def __init__(self, graph_path, clusters_path, output_dir):
         self.graph_path = graph_path
         self.clusters_path = clusters_path
+        self.output_dir = Path(output_dir)
         self.temp_dir = Path(tempfile.gettempdir()) / "metrics_temp"
         self.temp_dir.mkdir(exist_ok=True)
         
@@ -24,8 +29,98 @@ class MetricsComputer:
         self.avi_checkpoint = self.temp_dir / "avi_values.npy"
         self.progress_checkpoint = self.temp_dir / "progress.json"
         
+        # Register cleanup handlers
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        atexit.register(self.cleanup)
+        
         # Initialize progress tracking
         self.load_or_init_progress()
+
+    def signal_handler(self, signum, frame):
+        """Handle interruption signals by cleaning up before exit."""
+        print(f"\nReceived signal {signum}. Cleaning up...")
+        self.cleanup()
+        sys.exit(1)
+
+    def cleanup(self):
+        """Clean up all temporary files and resources."""
+        cleanup_errors = []
+
+        # Clean up memory-mapped arrays
+        print("\nCleaning up memory-mapped arrays...")
+        try:
+            if hasattr(self, 'edges') and isinstance(self.edges, np.memmap):
+                self.edges._mmap.close()
+                del self.edges
+        except Exception as e:
+            cleanup_errors.append(f"Failed to close edges memmap: {e}")
+
+        # List of checkpoint files to clean up
+        checkpoint_files = [
+            self.nodes_checkpoint,
+            self.edges_checkpoint,
+            self.clusters_checkpoint,
+            self.avu_checkpoint,
+            self.avi_checkpoint,
+            self.progress_checkpoint
+        ]
+
+        # Clean up checkpoint files
+        print("Cleaning up checkpoint files...")
+        for checkpoint in checkpoint_files:
+            if checkpoint.exists():
+                try:
+                    checkpoint.unlink()
+                    print(f"Successfully deleted: {checkpoint}")
+                except Exception as e:
+                    cleanup_errors.append(f"Could not delete {checkpoint}: {e}")
+
+        # Clean up temp directory with force
+        if self.temp_dir.exists():
+            try:
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+                print(f"Successfully removed temp directory: {self.temp_dir}")
+            except Exception as e:
+                cleanup_errors.append(f"Could not remove temp directory {self.temp_dir}: {e}")
+
+        # Force garbage collection
+        gc.collect()
+
+        # Report any cleanup errors
+        if cleanup_errors:
+            print("\nWarning: Some cleanup operations failed:")
+            for error in cleanup_errors:
+                print(f"- {error}")
+        else:
+            print("\nCleanup completed successfully.")
+
+    def verify_cleanup(self):
+        """Verify that all temporary files and directories have been cleaned up."""
+        verification_errors = []
+        
+        # Check if checkpoint files still exist
+        for checkpoint in [
+            self.nodes_checkpoint,
+            self.edges_checkpoint,
+            self.clusters_checkpoint,
+            self.avu_checkpoint,
+            self.avi_checkpoint,
+            self.progress_checkpoint
+        ]:
+            if checkpoint.exists():
+                verification_errors.append(f"Checkpoint file still exists: {checkpoint}")
+
+        # Check if temp directory still exists
+        if self.temp_dir.exists():
+            verification_errors.append(f"Temp directory still exists: {self.temp_dir}")
+
+        if verification_errors:
+            print("\nWarning: Cleanup verification failed:")
+            for error in verification_errors:
+                print(f"- {error}")
+            return False
+        return True
 
     def load_or_init_progress(self):
         """Load or initialize progress tracking."""
@@ -55,7 +150,7 @@ class MetricsComputer:
                 nodes_data = json.load(f)
                 self.nodes_list = nodes_data['nodes_list']
                 self.node_to_idx = {node: idx for idx, node in enumerate(self.nodes_list)}
-            self.edges = np.load(self.edges_checkpoint, mmap_mode='r')
+            self.edges = np.load(self.edges_checkpoint, mmap_mode='r', allow_pickle=True)
             return
 
         print("Processing graph...")
@@ -209,150 +304,211 @@ class MetricsComputer:
 
     def process_metrics(self):
         """Process metrics with checkpointing and memory management."""
-        print("Starting metrics computation...")
-        
-        # Read input data
-        self.read_graph_lazy()
-        self.read_clusters()
-        
-        # Sort cluster IDs for consistent ordering
-        cluster_ids = sorted(self.clusters.keys())
-        n_clusters = len(cluster_ids)
-        print(f"Processing {n_clusters} clusters...")
-        
-        # Create or load memory-mapped arrays for results
-        if not self.avu_checkpoint.exists():
-            avu_values = np.memmap(self.avu_checkpoint, dtype=np.float64,
-                                 mode='w+', shape=(n_clusters, n_clusters))
-            avu_values.fill(0)
-        else:
-            avu_values = np.memmap(self.avu_checkpoint, dtype=np.float64,
-                                 mode='r+', shape=(n_clusters, n_clusters))
-        
-        if not self.avi_checkpoint.exists():
-            avi_values = np.memmap(self.avi_checkpoint, dtype=np.float64,
-                                 mode='w+', shape=(n_clusters,))
-            avi_values.fill(0)
-        else:
-            avi_values = np.memmap(self.avi_checkpoint, dtype=np.float64,
-                                 mode='r+', shape=(n_clusters,))
-        
-        # Build adjacency dictionary in batches
-        EDGE_BATCH_SIZE = 1000000
-        adj_dict = defaultdict(dict)
-        
-        for i in range(0, len(self.edges), EDGE_BATCH_SIZE):
-            batch = self.edges[i:i + EDGE_BATCH_SIZE]
-            for u_idx, v_idx, w in batch:
-                w_norm = self.normalize_weight(w)
-                weight = 100.0 if w_norm >= 0.99 else 1.0 / (1.0 - w_norm)
-                u_idx, v_idx = int(u_idx), int(v_idx)
-                adj_dict[u_idx][v_idx] = weight
-                adj_dict[v_idx][u_idx] = weight
+        try:
+            print("Starting metrics computation...")
             
-            if i % (EDGE_BATCH_SIZE * 10) == 0:
-                print(f"Processed {i}/{len(self.edges)} edges...")
-        
-        # Process AVU values in batches
-        CLUSTER_BATCH_SIZE = 100
-        current_batch = self.progress['avu_current_batch']
-        
-        while current_batch * CLUSTER_BATCH_SIZE < n_clusters:
-            start_idx = current_batch * CLUSTER_BATCH_SIZE
-            end_idx = min((current_batch + 1) * CLUSTER_BATCH_SIZE, n_clusters)
+            # Read input data
+            self.read_graph_lazy()
+            self.read_clusters()
             
-            print(f"Processing AVU batch {current_batch + 1}/{(n_clusters + CLUSTER_BATCH_SIZE - 1) // CLUSTER_BATCH_SIZE}")
+            # Sort cluster IDs for consistent ordering
+            cluster_ids = sorted(self.clusters.keys())
+            n_clusters = len(cluster_ids)
+            print(f"Processing {n_clusters} clusters...")
             
-            for i in range(start_idx, end_idx):
-                Ci = self.clusters[cluster_ids[i]]
-                # Compute diagonal
-                val = self.compute_avu_dprime(Ci, Ci, adj_dict)
-                avu_values[i, i] = val
+            # Create or load memory-mapped arrays for results
+            if not self.avu_checkpoint.exists():
+                avu_values = np.memmap(self.avu_checkpoint, dtype=np.float64,
+                                     mode='w+', shape=(n_clusters, n_clusters))
+                avu_values.fill(0)
+            else:
+                avu_values = np.memmap(self.avu_checkpoint, dtype=np.float64,
+                                     mode='r+', shape=(n_clusters, n_clusters))
+            
+            if not self.avi_checkpoint.exists():
+                avi_values = np.memmap(self.avi_checkpoint, dtype=np.float64,
+                                     mode='w+', shape=(n_clusters,))
+                avi_values.fill(0)
+            else:
+                avi_values = np.memmap(self.avi_checkpoint, dtype=np.float64,
+                                     mode='r+', shape=(n_clusters,))
+            
+            # Build adjacency dictionary in batches
+            EDGE_BATCH_SIZE = 1000000
+            adj_dict = defaultdict(dict)
+            
+            for i in range(0, len(self.edges), EDGE_BATCH_SIZE):
+                batch = self.edges[i:i + EDGE_BATCH_SIZE]
+                for u_idx, v_idx, w in batch:
+                    w_norm = self.normalize_weight(w)
+                    weight = 100.0 if w_norm >= 0.99 else 1.0 / (1.0 - w_norm)
+                    u_idx, v_idx = int(u_idx), int(v_idx)
+                    adj_dict[u_idx][v_idx] = weight
+                    adj_dict[v_idx][u_idx] = weight
                 
-                # Compute pairs
-                for j in range(i + 1, n_clusters):
-                    Cj = self.clusters[cluster_ids[j]]
-                    val = self.compute_avu_dprime(Ci, Cj, adj_dict)
-                    avu_values[i, j] = val
-                    avu_values[j, i] = val  # Symmetric
+                if i % (EDGE_BATCH_SIZE * 10) == 0:
+                    print(f"Processed {i}/{len(self.edges)} edges...")
+            
+            # Process AVU values in batches
+            CLUSTER_BATCH_SIZE = 100
+            current_batch = self.progress['avu_current_batch']
+            
+            while current_batch * CLUSTER_BATCH_SIZE < n_clusters:
+                start_idx = current_batch * CLUSTER_BATCH_SIZE
+                end_idx = min((current_batch + 1) * CLUSTER_BATCH_SIZE, n_clusters)
                 
-                if i % 10 == 0:
-                    avu_values.flush()
-                    self.progress['avu_current_batch'] = current_batch
-                    self.save_progress()
-            
-            current_batch += 1
-            gc.collect()
-        
-        # Process AVI values
-        current_idx = self.progress['avi_current_idx']
-        
-        while current_idx < n_clusters:
-            print(f"Processing AVI values: {current_idx}/{n_clusters}")
-            
-            for i in range(current_idx, min(current_idx + CLUSTER_BATCH_SIZE, n_clusters)):
-                Ci = self.clusters[cluster_ids[i]]
-                val = self.compute_avi_dprime(Ci, adj_dict)
-                avi_values[i] = val
+                print(f"Processing AVU batch {current_batch + 1}/{(n_clusters + CLUSTER_BATCH_SIZE - 1) // CLUSTER_BATCH_SIZE}")
                 
-                if i % 10 == 0:
-                    avi_values.flush()
-                    self.progress['avi_current_idx'] = i
-                    self.save_progress()
+                for i in range(start_idx, end_idx):
+                    Ci = self.clusters[cluster_ids[i]]
+                    # Compute diagonal
+                    val = self.compute_avu_dprime(Ci, Ci, adj_dict)
+                    avu_values[i, i] = val
+                    
+                    # Compute pairs
+                    for j in range(i + 1, n_clusters):
+                        Cj = self.clusters[cluster_ids[j]]
+                        val = self.compute_avu_dprime(Ci, Cj, adj_dict)
+                        avu_values[i, j] = val
+                        avu_values[j, i] = val  # Symmetric
+                    
+                    if i % 10 == 0:
+                        avu_values.flush()
+                        self.progress['avu_current_batch'] = current_batch
+                        self.save_progress()
+                
+                current_batch += 1
+                gc.collect()
             
-            current_idx += CLUSTER_BATCH_SIZE
-            gc.collect()
-        
-        # Compute final metrics
-        print("Computing final metrics...")
-        
-        if n_clusters == 1:
-            finalAVI = float(avi_values[0])
-            finalAVU = float(avu_values[0, 0])
-        else:
-            finalAVI = float(np.mean(avi_values))
+            # Process AVI values
+            current_idx = self.progress['avi_current_idx']
             
-            # Compute mean of upper triangle for AVU
-            mask = np.triu(np.ones((n_clusters, n_clusters), dtype=bool), k=1)
-            finalAVU = float(np.mean(avu_values[mask]))
-        
-        if finalAVU == 0.0:
-            finalQANUI = float("inf")
-        else:
-            finalQANUI = ((2.0 * finalAVI * (1.0 / finalAVU)) /
-                         (finalAVI + (1.0 / finalAVU))) / 2
-        
-        # Print results
-        print("\n===== FINAL METRICS =====")
-        print(f"Final AVI'' = {finalAVI:.5f}")
-        print(f"Final AVU'' = {finalAVU:.5f}" if finalAVU != float('inf')
-              else "Final AVU'' = Inf")
-        if finalQANUI == float("inf"):
-            print("Final QANUI' = Infinity (division by zero in 1/AVU)")
-        else:
-            print(f"Final QANUI' = {finalQANUI:.5f}")
-        
-        # Save final results
-        results = {
-            'finalAVI': finalAVI,
-            'finalAVU': finalAVU,
-            'finalQANUI': finalQANUI,
-            'n_clusters': n_clusters
-        }
-        
-        with open(self.temp_dir / "final_results.json", 'w') as f:
-            json.dump(results, f)
-        
-        print("\nResults saved to:", self.temp_dir / "final_results.json")
-        print("Done.")
+            while current_idx < n_clusters:
+                print(f"Processing AVI values: {current_idx}/{n_clusters}")
+                
+                for i in range(current_idx, min(current_idx + CLUSTER_BATCH_SIZE, n_clusters)):
+                    Ci = self.clusters[cluster_ids[i]]
+                    val = self.compute_avi_dprime(Ci, adj_dict)
+                    avi_values[i] = val
+                    
+                    if i % 10 == 0:
+                        avi_values.flush()
+                        self.progress['avi_current_idx'] = i
+                        self.save_progress()
+                
+                current_idx += CLUSTER_BATCH_SIZE
+                gc.collect()
+            
+            # Compute final metrics
+            print("Computing final metrics...")
+            
+            if n_clusters == 1:
+                finalAVI = float(avi_values[0])
+                finalAVU = float(avu_values[0, 0])
+            else:
+                finalAVI = float(np.mean(avi_values))
+                
+                # Compute mean of upper triangle for AVU
+                mask = np.triu(np.ones((n_clusters, n_clusters), dtype=bool), k=1)
+                finalAVU = float(np.mean(avu_values[mask]))
+            
+            if finalAVU == 0.0:
+                finalQANUI = float("inf")
+            else:
+                finalQANUI = ((2.0 * finalAVI * (1.0 / finalAVU)) /
+                             (finalAVI + (1.0 / finalAVU))) / 2
+            
+            # Print results
+            print("\n===== FINAL METRICS =====")
+            print(f"Final AVI'' = {finalAVI:.5f}")
+            print(f"Final AVU'' = {finalAVU:.5f}" if finalAVU != float('inf')
+                  else "Final AVU'' = Inf")
+            if finalQANUI == float("inf"):
+                print("Final QANUI' = Infinity (division by zero in 1/AVU)")
+            else:
+                print(f"Final QANUI' = {finalQANUI:.5f}")
+            
+            # Save final results to metrics.log
+            metrics_log = (
+                "===== FINAL METRICS =====\n"
+                f"Final AVI'' = {finalAVI:.5f}\n"
+                f"Final AVU'' = {'Inf' if finalAVU == float('inf') else f'{finalAVU:.5f}'}\n"
+                f"Final QANUI' = {'Infinity (division by zero in 1/AVU)' if finalQANUI == float('inf') else f'{finalQANUI:.5f}'}\n"
+            )
+            
+            with open(self.output_dir / "metrics.log", 'w') as f:
+                f.write(metrics_log)
+            
+            print("\nResults saved to:", self.output_dir / "metrics.log")
+
+        except Exception as e:
+            print(f"\nError during metrics computation: {e}")
+            raise
+        finally:
+            # Always attempt cleanup
+            self.cleanup()
+            # Verify cleanup was successful
+            self.verify_cleanup()
 
 def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    graph_path = os.path.join(script_dir, "graph.txt")
-    clusters_path = os.path.join(script_dir, "clusters.txt")
+    # Set up argument parser
+    parser = argparse.ArgumentParser(
+        description="Process metrics for graph and cluster data.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python metrics_distributed.py /path/to/clusters.txt /path/to/output/dir
+    python metrics_distributed.py --graph /path/to/graph.txt /path/to/clusters.txt /path/to/output/dir
+        """
+    )
     
-    computer = MetricsComputer(graph_path, clusters_path)
+    # Add arguments
+    parser.add_argument(
+        "clusters_path",
+        type=str,
+        help="Path to the clusters file (clusters.txt)"
+    )
+    parser.add_argument(
+        "output_dir",
+        type=str,
+        help="Directory where metrics.log will be saved"
+    )
+    parser.add_argument(
+        "--graph",
+        type=str,
+        help="Path to the graph file (default: graph.txt in script directory)",
+        default=None
+    )
+    
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Validate file paths
+    if not os.path.exists(args.clusters_path):
+        print(f"Error: Clusters file not found: {args.clusters_path}")
+        sys.exit(1)
+        
+    # Set graph path (maintain backward compatibility)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    graph_path = args.graph if args.graph else os.path.join(script_dir, "graph.txt")
+    
+    if not os.path.exists(graph_path):
+        print(f"Error: Graph file not found: {graph_path}")
+        sys.exit(1)
+        
+    # Validate output directory
+    output_dir = Path(args.output_dir)
+    if not output_dir.exists():
+        print(f"Creating output directory: {output_dir}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+    elif not output_dir.is_dir():
+        print(f"Error: Output path exists but is not a directory: {output_dir}")
+        sys.exit(1)
+        
+    # Initialize and run metrics computer
+    computer = MetricsComputer(graph_path, args.clusters_path, args.output_dir)
     computer.process_metrics()
+
 
 if __name__ == "__main__":
     main()

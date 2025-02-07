@@ -1,3 +1,7 @@
+#!/usr/bin/env python3
+import sys
+import os
+
 def parse_and_format_clusters(input_file, output_file):
     """
     Parses clustering results in the given input file and formats them into the desired output format.
@@ -15,16 +19,18 @@ def parse_and_format_clusters(input_file, output_file):
             for line in infile:
                 # Look for lines containing vector elements
                 if "std::vector of length" in line:
-                    # Extract the cluster members from the next line
+                    # Extract the cluster members from the line content between '{' and '}'
                     start = line.find('{') + 1
                     end = line.find('}')
-                    members = line[start:end].split(',')  # Extract members
-                    members = [member.strip() for member in members if member.strip()]  # Clean members
+                    if start == 0 or end == -1:
+                        continue
+                    members = line[start:end].split(',')
+                    members = [member.strip() for member in members if member.strip()]
 
                     # Write each member with its cluster ID
                     for member in members:
                         outfile.write(f"{cluster_id} {member}\n")
-
+                    
                     cluster_id += 1  # Increment the cluster ID for the next cluster
 
     except FileNotFoundError:
@@ -32,14 +38,30 @@ def parse_and_format_clusters(input_file, output_file):
     except Exception as e:
         print(f"An error occurred: {e}")
 
-
 if __name__ == "__main__":
-    # Input file in the original format
-    input_file = "result_lines.log"
-    # Output file in the desired format
-    output_file = "clusters.txt"
+    # Ensure the proper number of command line arguments was provided
+    if len(sys.argv) != 3:
+        print(f"Usage: {sys.argv[0]} inputfile desiredoutputdirectory")
+        sys.exit(1)
+    
+    # Get command line arguments
+    input_file = sys.argv[1]
+    output_directory = sys.argv[2]
 
-    # Convert and format the clusters
+    # Validate the input file
+    if not os.path.exists(input_file):
+        print(f"Error: The input file '{input_file}' does not exist.")
+        sys.exit(1)
+    
+    # Validate that the output directory exists
+    if not os.path.isdir(output_directory):
+        print(f"Error: The directory '{output_directory}' does not exist.")
+        sys.exit(1)
+
+    # Define the output file path
+    output_file = os.path.join(output_directory, "clusters.txt")
+
+    # Parse and format the clusters
     parse_and_format_clusters(input_file, output_file)
     print(f"Formatted clusters written to {output_file}")
 

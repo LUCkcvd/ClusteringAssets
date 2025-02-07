@@ -9,22 +9,17 @@ os.makedirs(output_dir, exist_ok=True)
 # Regex for directory names containing single parameters
 param_pattern = re.compile(r"(?P<param>[due])_(?P<value>[\d.]+)")
 
-# Regex for extracting 'sys' runtime from runtime.log
-runtime_pattern = re.compile(r"sys\s+(\d+)m([\d.]+)s")
-
-# Function to parse the sys runtime from runtime.log
+# Function to parse the runtime (in seconds) from runtime.log
 def parse_runtime(file_path):
     print(f"Parsing runtime from file: {file_path}")
     with open(file_path, 'r') as file:
-        for line in file:
-            match = runtime_pattern.search(line.strip())
-            if match:
-                minutes = int(match.group(1))
-                seconds = float(match.group(2))
-                runtime = minutes * 60 + seconds  # Convert to total seconds
-                return runtime
-    print(f"No valid runtime found in {file_path}")
-    return None
+        content = file.read().strip()  # Read the full content and strip whitespace
+        try:
+            runtime = float(content)  # Directly convert to a float which represents seconds
+            return runtime
+        except ValueError:
+            print(f"Failed to parse runtime from {file_path}")
+            return None
 
 # Data storage for each parameter
 data = {"d": {}, "u": {}, "e": {}}
